@@ -44,9 +44,9 @@ func main() {
 			return strings.ToLower(strings.TrimSpace(ans)) == "y"
 		},
 	}
-	_ = enforcer 
 
 	dispatcher := tools.NewDispatcher(ws)
+	dispatcher.Enforcer = enforcer
 
 	pb := prompt.NewBuilder(ws)
 
@@ -126,7 +126,7 @@ func fatalf(format string, args ...any) {
 }
 
 func printHelp() {
-	fmt.Println(`
+	fmt.Print(`
 Commands:
   /clear    Clear conversation history (start fresh)
   /exit     Exit the REPL
