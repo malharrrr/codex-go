@@ -9,23 +9,25 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"codex-go/sandbox"
 )
 
 type ToolCall struct {
-	ID   string          `json:"id"`   
-	Name string          `json:"name"` 
+	ID   string          `json:"id"`
+	Name string          `json:"name"`
 	Args json.RawMessage `json:"args"`
 }
 
 type ToolResult struct {
-	ToolCallID string `json:"tool_call_id"` 
+	ToolCallID string `json:"tool_call_id"`
 	Output     string `json:"output"`
 	IsError    bool   `json:"is_error"`
 }
 
 type Dispatcher struct {
-	WorkspaceRoot string
+	WorkspaceRoot  string
 	DefaultTimeout time.Duration
+	Enforcer       *sandbox.Enforcer
 }
 
 func NewDispatcher(workspaceRoot string) *Dispatcher {
@@ -63,6 +65,12 @@ func (d *Dispatcher) handleShell(ctx context.Context, call ToolCall) ToolResult 
 	var args shellArgs
 	if err := json.Unmarshal(call.Args, &args); err != nil {
 		return errResult(call.ID, "bad args: "+err.Error())
+	}
+
+	if d.Enforcer != nil {
+		if err := d.Enforcer.CheckApproval("shell", args.Command); err != nil {
+			return errResult(call.ID, err.Error())
+		}
 	}
 
 	timeout := d.DefaultTimeout
@@ -140,6 +148,13 @@ func (d *Dispatcher) handleWriteFile(call ToolCall) ToolResult {
 	}
 
 	abs := d.abs(args.Path)
+
+	if d.Enforcer != nil {
+		if err := d.Enforcer.CheckWrite(abs); err != nil {
+			return errResult(call.ID, err.Error())
+		}
+	}
+
 	if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
 		return errResult(call.ID, "mkdir: "+err.Error())
 	}
