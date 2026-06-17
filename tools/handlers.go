@@ -81,8 +81,13 @@ func (d *Dispatcher) handleShell(ctx context.Context, call ToolCall) ToolResult 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", args.Command)
-	cmd.Dir = d.WorkspaceRoot
+	cmd := exec.CommandContext(ctx, "docker", "run", 
+		"--rm", 
+		"-v", fmt.Sprintf("%s:/workspace", d.WorkspaceRoot),
+		"-w", "/workspace",
+		"alpine:latest", 
+		"/bin/sh", "-c", args.Command,
+	)
 
 	out, err := cmd.CombinedOutput()
 	output := string(out)
