@@ -10,16 +10,17 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"codex-go/prompt"
 	"codex-go/tools"
 )
 
 type Config struct {
-	APIKey string
-	Model string
+	APIKey   string
+	Model    string
 	MaxTurns int
-	Verbose bool
+	Verbose  bool
 }
 
 func (c *Config) apiKey() string {
@@ -47,7 +48,7 @@ type Agent struct {
 	cfg        Config
 	dispatcher *tools.Dispatcher
 	pb         *prompt.Builder
-	history    []prompt.Message // full conversation history, excluding system/env
+	history    []prompt.Message 
 }
 
 func New(cfg Config, dispatcher *tools.Dispatcher, pb *prompt.Builder) *Agent {
@@ -58,6 +59,37 @@ func New(cfg Config, dispatcher *tools.Dispatcher, pb *prompt.Builder) *Agent {
 	}
 }
 
+func estimateTokens(messages []prompt.Message) int {
+	chars := 0
+	for _, m := range messages {
+		if str, ok := m.Content.(string); ok {
+			chars += len(str)
+		} else if parts, ok := m.Content.([]prompt.ContentPart); ok {
+			for _, p := range parts {
+				chars += len(p.Content)
+			}
+		}
+	}
+	return chars / 4
+}
+
+func (a *Agent) compactHistory() {
+	const maxTokens = 6000
+
+	if estimateTokens(a.history) > maxTokens {
+		cutoff := int(float64(len(a.history)) * 0.4)
+
+		if cutoff%2 != 0 {
+			cutoff++
+		}
+
+		a.history = a.history[cutoff:]
+		if a.cfg.Verbose {
+			fmt.Fprintf(os.Stderr, "[system] compacted history to prevent token overflow\n")
+		}
+	}
+}
+
 func (a *Agent) Run(ctx context.Context, userMessage string) (string, error) {
 	a.history = append(a.history, prompt.Message{
 		Role:    "user",
@@ -65,6 +97,8 @@ func (a *Agent) Run(ctx context.Context, userMessage string) (string, error) {
 	})
 
 	for turn := 0; turn < a.cfg.maxTurns(); turn++ {
+		a.compactHistory()
+
 		if a.cfg.Verbose {
 			fmt.Fprintf(os.Stderr, "\n[agent] turn %d\n", turn+1)
 		}
@@ -94,24 +128,42 @@ func (a *Agent) Run(ctx context.Context, userMessage string) (string, error) {
 		})
 
 		var resultParts []prompt.ContentPart
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+
 		for _, tc := range resp.ToolCalls {
-			if a.cfg.Verbose {
-				fmt.Fprintf(os.Stderr, "[tool] %s %s\n", tc.Name, string(tc.Args))
-			}
-			result := a.dispatcher.Dispatch(ctx, tc)
-			if a.cfg.Verbose {
-				preview := result.Output
-				if len(preview) > 200 {
-					preview = preview[:200] + "…"
+			wg.Add(1)
+			go func(call tools.ToolCall) {
+				defer wg.Done()
+
+				if a.cfg.Verbose {
+					mu.Lock()
+					fmt.Fprintf(os.Stderr, "[tool] %s %s\n", call.Name, string(call.Args))
+					mu.Unlock()
 				}
-				fmt.Fprintf(os.Stderr, "[tool result] isError=%v output=%q\n", result.IsError, preview)
-			}
-			resultParts = append(resultParts, prompt.ContentPart{
-				Type:       "tool_result",
-				ToolCallID: result.ToolCallID,
-				Content:    result.Output,
-			})
+				
+				result := a.dispatcher.Dispatch(ctx, call)
+				
+				if a.cfg.Verbose {
+					preview := result.Output
+					if len(preview) > 200 {
+						preview = preview[:200] + "…"
+					}
+					mu.Lock()
+					fmt.Fprintf(os.Stderr, "[tool result] isError=%v output=%q\n", result.IsError, preview)
+					mu.Unlock()
+				}
+
+				mu.Lock()
+				resultParts = append(resultParts, prompt.ContentPart{
+					Type:       "tool_result",
+					ToolCallID: result.ToolCallID,
+					Content:    result.Output,
+				})
+				mu.Unlock()
+			}(tc)
 		}
+		wg.Wait()
 
 		a.history = append(a.history, prompt.Message{
 			Role:    "tool",
@@ -139,15 +191,15 @@ type openAIRequest struct {
 }
 
 type openAIMsg struct {
-	Role       string              `json:"role"`
-	Content    any                 `json:"content,omitempty"`
-	ToolCallID string              `json:"tool_call_id,omitempty"`
-	ToolCalls  []openAIToolCall    `json:"tool_calls,omitempty"`
+	Role       string           `json:"role"`
+	Content    any              `json:"content,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
 }
 
 type openAITool struct {
-	Type     string          `json:"type"`
-	Function openAIFuncSpec  `json:"function"`
+	Type     string         `json:"type"`
+	Function openAIFuncSpec `json:"function"`
 }
 
 type openAIFuncSpec struct {
@@ -158,24 +210,11 @@ type openAIFuncSpec struct {
 
 type openAIToolCall struct {
 	ID       string `json:"id"`
-	Type     string `json:"type"` 
+	Type     string `json:"type"`
 	Function struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
-}
-
-type openAIResponse struct {
-	Choices []struct {
-		Message struct {
-			Content   string           `json:"content"`
-			ToolCalls []openAIToolCall `json:"tool_calls"`
-		} `json:"message"`
-		FinishReason string `json:"finish_reason"`
-	} `json:"choices"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error"`
 }
 
 func (a *Agent) callModel(ctx context.Context, messages []prompt.Message) (modelResponse, error) {
@@ -235,7 +274,7 @@ func (a *Agent) callModel(ctx context.Context, messages []prompt.Message) (model
 		Model:    a.cfg.model(),
 		Messages: finalMsgs,
 		Tools:    apiTools,
-		Stream:   false,
+		Stream:   true,
 	})
 	if err != nil {
 		return modelResponse{}, err
@@ -256,37 +295,13 @@ func (a *Agent) callModel(ctx context.Context, messages []prompt.Message) (model
 	}
 	defer httpResp.Body.Close()
 
-	body, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return modelResponse{}, err
+	if httpResp.StatusCode != 200 {
+		body, _ := io.ReadAll(httpResp.Body)
+		return modelResponse{}, fmt.Errorf("API error (%d): %s", httpResp.StatusCode, string(body))
 	}
 
-	var apiResp openAIResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return modelResponse{}, fmt.Errorf("bad response JSON: %w\nbody: %s", err, body)
-	}
-	if apiResp.Error != nil {
-		return modelResponse{}, fmt.Errorf("API error: %s", apiResp.Error.Message)
-	}
-	if len(apiResp.Choices) == 0 {
-		return modelResponse{}, fmt.Errorf("no choices in response")
-	}
-
-	choice := apiResp.Choices[0].Message
-
-	var tcs []tools.ToolCall
-	for _, tc := range choice.ToolCalls {
-		tcs = append(tcs, tools.ToolCall{
-			ID:   tc.ID,
-			Name: tc.Function.Name,
-			Args: json.RawMessage(tc.Function.Arguments),
-		})
-	}
-
-	return modelResponse{
-		Content:   choice.Content,
-		ToolCalls: tcs,
-	}, nil
+	sp := NewStreamingPrinter(os.Stdout)
+	return sp.PrintAndAccumulate(httpResp.Body)
 }
 
 type assistantToolCallMarker struct {
@@ -319,29 +334,59 @@ func NewStreamingPrinter(w io.Writer) *StreamingPrinter {
 	return &StreamingPrinter{w: w}
 }
 
-func (sp *StreamingPrinter) Print(r io.Reader) {
+func (sp *StreamingPrinter) PrintAndAccumulate(r io.Reader) (modelResponse, error) {
+	var finalResp modelResponse
+	var toolCallMap = make(map[int]*tools.ToolCall)
+	
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
+		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
 			continue
 		}
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
-			break
-		}
+		
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content string `json:"content"`
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 			} `json:"choices"`
 		}
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk); err != nil {
 			continue
 		}
 		if len(chunk.Choices) > 0 {
-			fmt.Fprint(sp.w, chunk.Choices[0].Delta.Content)
+			delta := chunk.Choices[0].Delta
+			
+			if delta.Content != "" {
+				fmt.Fprint(sp.w, delta.Content)
+				finalResp.Content += delta.Content
+			}
+			
+			for _, tcDelta := range delta.ToolCalls {
+				tc, exists := toolCallMap[tcDelta.Index]
+				if !exists {
+					tc = &tools.ToolCall{ID: tcDelta.ID, Name: tcDelta.Function.Name}
+					toolCallMap[tcDelta.Index] = tc
+				}
+				tc.Args = append(tc.Args, []byte(tcDelta.Function.Arguments)...)
+			}
 		}
 	}
+	
+	for _, tc := range toolCallMap {
+		finalResp.ToolCalls = append(finalResp.ToolCalls, *tc)
+	}
+	
+	fmt.Fprintln(sp.w)
+	return finalResp, scanner.Err()
 }
