@@ -21,6 +21,8 @@ func main() {
 	verbose := flag.Bool("verbose", false, "Print tool calls and results to stderr")
 	autoApprove := flag.Bool("auto-approve", false, "Skip confirmation prompts for shell commands")
 	task := flag.String("task", "", "Run a single task non-interactively then exit")
+	maxContextTokens := flag.Int("max-context-tokens", 128000, "Model context window size, used to trigger compaction")
+	compactionThreshold := flag.Float64("compaction-threshold", 0.75, "Fraction of context window that triggers compaction (0-1)")
 	flag.Parse()
 
 	ws, err := resolveWorkspace(*workspace)
@@ -51,9 +53,11 @@ func main() {
 	pb := prompt.NewBuilder(ws)
 
 	agent := loop.New(loop.Config{
-		Model:    *model,
-		MaxTurns: *maxTurns,
-		Verbose:  *verbose,
+		Model:               *model,
+		MaxTurns:            *maxTurns,
+		Verbose:             *verbose,
+		MaxContextTokens:    *maxContextTokens,
+		CompactionThreshold: *compactionThreshold,
 	}, dispatcher, pb)
 
 	if *task != "" {
@@ -102,7 +106,8 @@ func runTask(agent *loop.Agent, task string) {
 		return
 	}
 	fmt.Println(strings.Repeat("─", 60))
-	fmt.Println(result)
+	fmt.Print(result)
+	fmt.Println()
 	fmt.Println(strings.Repeat("─", 60))
 }
 
@@ -139,6 +144,8 @@ Flags (set at startup):
   -verbose       Print tool calls to stderr
   -auto-approve  Skip shell command approval prompts
   -task          Run one task non-interactively then exit
+  -max-context-tokens     Model context window (default: 128000)
+  -compaction-threshold   Fraction of window that triggers summarization (default: 0.75)
 
 Example tasks:
   > List all Go files in this project and count lines of code
