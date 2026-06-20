@@ -48,11 +48,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, call ToolCall) ToolResult {
 	case "list_dir":
 		return d.handleListDir(call)
 	default:
-		return ToolResult{
-			ToolCallID: call.ID,
-			Output:     fmt.Sprintf("unknown tool: %q", call.Name),
-			IsError:    true,
-		}
+		return ToolResult{ToolCallID: call.ID, Output: fmt.Sprintf("unknown tool: %q", call.Name), IsError: true}
 	}
 }
 
@@ -81,13 +77,8 @@ func (d *Dispatcher) handleShell(ctx context.Context, call ToolCall) ToolResult 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "docker", "run", 
-		"--rm", 
-		"-v", fmt.Sprintf("%s:/workspace", d.WorkspaceRoot),
-		"-w", "/workspace",
-		"alpine:latest", 
-		"/bin/sh", "-c", args.Command,
-	)
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", args.Command)
+	cmd.Dir = d.WorkspaceRoot
 
 	out, err := cmd.CombinedOutput()
 	output := string(out)
