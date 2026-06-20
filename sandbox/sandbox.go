@@ -7,7 +7,7 @@ import (
 )
 
 type Policy struct {
-	Mode Mode
+	Mode          Mode
 	WritableRoots []string
 	ReadonlyPaths []string
 }
@@ -54,7 +54,16 @@ const (
 type Enforcer struct {
 	Policy         Policy
 	ApprovalPolicy ApprovalPolicy
-	Prompter func(toolName, command string) bool
+	Prompter       func(toolName, command string) bool
+}
+
+func isWithin(candidate, root string) bool {
+	c := filepath.Clean(candidate)
+	r := filepath.Clean(root)
+	if c == r {
+		return true
+	}
+	return strings.HasPrefix(c, r+string(filepath.Separator))
 }
 
 func (e *Enforcer) CheckWrite(path string) error {
@@ -67,7 +76,7 @@ func (e *Enforcer) CheckWrite(path string) error {
 	}
 
 	for _, ro := range e.Policy.ReadonlyPaths {
-		if strings.HasPrefix(abs, ro) {
+		if isWithin(abs, ro) {
 			return fmt.Errorf("write blocked: %q is in a read-only path (%s)", path, ro)
 		}
 	}
@@ -75,8 +84,9 @@ func (e *Enforcer) CheckWrite(path string) error {
 	if e.Policy.Mode == ReadOnly {
 		return fmt.Errorf("write blocked: sandbox is read-only")
 	}
+
 	for _, root := range e.Policy.WritableRoots {
-		if strings.HasPrefix(abs, root) {
+		if isWithin(abs, root) {
 			return nil
 		}
 	}
