@@ -10,18 +10,22 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	
+
 	"codex-go/prompt"
 	"codex-go/tools"
 )
 
+type Dispatcher interface {
+	Dispatch(ctx context.Context, call tools.ToolCall) tools.ToolResult
+}
+
 type Config struct {
-	APIKey   string
-	Model    string
-	MaxTurns int
-	Verbose  bool
+	APIKey              string
+	Model               string
+	MaxTurns            int
+	Verbose             bool
 	MaxContextTokens    int
-	CompactionThreshold float64 
+	CompactionThreshold float64
 }
 
 func (c *Config) apiKey() string {
@@ -59,14 +63,20 @@ func (c *Config) compactionThreshold() float64 {
 	return 0.75
 }
 
-type Agent struct {
-	cfg        Config
-	dispatcher *tools.Dispatcher
-	pb         *prompt.Builder
-	history    []prompt.Message
+type StreamTargeter interface {
+	io.Writer
 }
 
-func New(cfg Config, dispatcher *tools.Dispatcher, pb *prompt.Builder) *Agent {
+type Agent struct {
+	cfg        Config
+	dispatcher Dispatcher
+	pb         *prompt.Builder
+	history    []prompt.Message
+	OnTokenUpdate func(total int)
+	StreamTarget StreamTargeter
+}
+
+func New(cfg Config, dispatcher Dispatcher, pb *prompt.Builder) *Agent {
 	return &Agent{cfg: cfg, dispatcher: dispatcher, pb: pb}
 }
 
@@ -141,7 +151,7 @@ func (a *Agent) compactHistory(ctx context.Context, u *usage) (bool, error) {
 	naiveCut := len(a.history) / 2
 	cut := safeCutIndex(a.history, naiveCut)
 	if cut <= 0 || cut >= len(a.history) {
-		return false, nil // no safe place to cut
+		return false, nil
 	}
 
 	toSummarize := a.history[:cut]
@@ -163,7 +173,6 @@ func (a *Agent) compactHistory(ctx context.Context, u *usage) (bool, error) {
 			summary,
 		),
 	}
-
 	a.history = append([]prompt.Message{summaryMsg}, kept...)
 
 	if a.cfg.Verbose {
@@ -220,7 +229,7 @@ func (a *Agent) Run(ctx context.Context, userMessage string) (string, error) {
 		if compacted, err := a.compactHistory(ctx, lastUsage); err != nil {
 			return "", fmt.Errorf("compaction failed: %w", err)
 		} else if compacted {
-			lastUsage = nil 
+			lastUsage = nil
 		}
 
 		if a.cfg.Verbose {
@@ -239,6 +248,10 @@ func (a *Agent) Run(ctx context.Context, userMessage string) (string, error) {
 		}
 		lastUsage = u
 
+		if u != nil && a.OnTokenUpdate != nil {
+			a.OnTokenUpdate(u.totalTokens)
+		}
+
 		if len(resp.ToolCalls) == 0 {
 			finalMsg := resp.Content
 			a.history = append(a.history, prompt.Message{Role: "assistant", Content: finalMsg})
@@ -250,7 +263,6 @@ func (a *Agent) Run(ctx context.Context, userMessage string) (string, error) {
 			Content: assistantWithToolCalls(resp),
 		})
 
-		var resultParts []prompt.ContentPart
 		for _, tc := range resp.ToolCalls {
 			if a.cfg.Verbose {
 				fmt.Fprintf(os.Stderr, "[tool] %s %s\n", tc.Name, string(tc.Args))
@@ -263,13 +275,15 @@ func (a *Agent) Run(ctx context.Context, userMessage string) (string, error) {
 				}
 				fmt.Fprintf(os.Stderr, "[tool result] isError=%v output=%q\n", result.IsError, preview)
 			}
-			resultParts = append(resultParts, prompt.ContentPart{
-				Type:       "tool_result",
-				ToolCallID: result.ToolCallID,
-				Content:    result.Output,
+			a.history = append(a.history, prompt.Message{
+				Role: "tool",
+				Content: []prompt.ContentPart{{
+					Type:       "tool_result",
+					ToolCallID: result.ToolCallID,
+					Content:    result.Output,
+				}},
 			})
 		}
-		a.history = append(a.history, prompt.Message{Role: "tool", Content: resultParts})
 	}
 
 	return "", fmt.Errorf("exceeded max turns (%d) without completing task", a.cfg.maxTurns())
@@ -368,7 +382,11 @@ func (a *Agent) callModel(ctx context.Context, messages []prompt.Message) (model
 		return modelResponse{}, nil, fmt.Errorf("API error (%d): %s", httpResp.StatusCode, string(body))
 	}
 
-	sp := NewStreamingPrinter(os.Stdout)
+	out := io.Writer(os.Stdout)
+	if a.StreamTarget != nil {
+		out = a.StreamTarget
+	}
+	sp := NewStreamingPrinter(out)
 	resp, u, err := sp.PrintAndAccumulate(httpResp.Body)
 	return resp, u, err
 }
@@ -458,9 +476,11 @@ func (sp *StreamingPrinter) PrintAndAccumulate(r io.Reader) (modelResponse, *usa
 		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk); err != nil {
 			continue
 		}
+
 		if chunk.Usage != nil {
 			u = &usage{totalTokens: chunk.Usage.TotalTokens}
 		}
+
 		if len(chunk.Choices) > 0 {
 			delta := chunk.Choices[0].Delta
 			if delta.Content != "" {
